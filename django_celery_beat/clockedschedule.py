@@ -6,7 +6,18 @@ from celery.utils.time import maybe_make_aware
 from .utils import NEVER_CHECK_TIMEOUT
 
 
-class clocked(schedules.BaseSchedule):  # noqa: PLW1641
+def _get_clocked_time_tz(app):
+    """Return timezone for interpreting naive clocked_time (local time, not UTC)."""
+    if app is not None and getattr(app.conf, 'timezone', None):
+        return app.conf.timezone
+    try:
+        from django.utils import timezone as django_tz
+        return django_tz.get_current_timezone()
+    except Exception:
+        return None
+
+
+class clocked(schedules.BaseSchedule):
     """clocked schedule.
 
     Depends on PeriodicTask one_off=True
@@ -14,7 +25,13 @@ class clocked(schedules.BaseSchedule):  # noqa: PLW1641
 
     def __init__(self, clocked_time, nowfun=None, app=None):
         """Initialize clocked."""
-        self.clocked_time = maybe_make_aware(clocked_time)
+        tz = _get_clocked_time_tz(app)
+        if tz is not None:
+            # Interpret naive datetimes as local time (Django/celery app TZ), not UTC,
+            # so "3:00 PM" runs at 3 PM local instead of 3 PM UTC.
+            self.clocked_time = maybe_make_aware(clocked_time, tz=tz, naive_as_utc=False)
+        else:
+            self.clocked_time = maybe_make_aware(clocked_time)
         super().__init__(nowfun=nowfun, app=app)
 
     def remaining_estimate(self, last_run_at):
