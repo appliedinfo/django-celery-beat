@@ -17,7 +17,7 @@ def _get_clocked_time_tz(app):
         return None
 
 
-class clocked(schedules.BaseSchedule):
+class clocked(schedules.BaseSchedule):  # noqa: PLW1641
     """clocked schedule.
 
     Depends on PeriodicTask one_off=True

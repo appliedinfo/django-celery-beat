@@ -1,15 +1,17 @@
-import datetime
 import os
+from datetime import datetime, timedelta
+from unittest.mock import patch
 
 try:
     from zoneinfo import ZoneInfo, available_timezones
 except ImportError:
-    from backports.zoneinfo import available_timezones, ZoneInfo
+    from backports.zoneinfo import ZoneInfo, available_timezones
 
 import pytest
 from celery import schedules
 from django.apps import apps
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.db.migrations.autodetector import MigrationAutodetector
 from django.db.migrations.loader import MigrationLoader
 from django.db.migrations.questioner import NonInteractiveMigrationQuestioner
@@ -19,8 +21,9 @@ from django.utils import timezone
 
 from django_celery_beat import migrations as beat_migrations
 from django_celery_beat.models import (DAYS, ClockedSchedule, CrontabSchedule,
-                                       IntervalSchedule, PeriodicTasks,
-                                       SolarSchedule,
+                                       FormatError, IntervalSchedule,
+                                       MissingFieldError, PeriodicTasks,
+                                       SolarSchedule, WrongArgumentError,
                                        crontab_schedule_celery_timezone)
 from t.proj.models import O2OToPeriodicTasks
 
@@ -142,6 +145,62 @@ class IntervalScheduleTestCase(TestCase, TestDuplicatesMixin):
         schedule = schedules.schedule(run_every=1.0)
         self._test_duplicate_schedules(IntervalSchedule, kwargs, schedule)
 
+    def test_from_schedule_default_period_seconds(self):
+        schedule = schedules.schedule(run_every=timedelta(minutes=3))
+        result = IntervalSchedule.from_schedule(schedule)
+        self.assertIsInstance(result.every, int)
+        self.assertEqual(result.every, 180)
+        self.assertEqual(result.period, IntervalSchedule.SECONDS)
+
+    def test_from_schedule_period_minutes(self):
+        schedule = schedules.schedule(run_every=timedelta(minutes=3))
+        result = IntervalSchedule.from_schedule(
+            schedule,
+            period=IntervalSchedule.MINUTES
+        )
+        self.assertIsInstance(result.every, int)
+        self.assertEqual(result.every, 3)
+        self.assertEqual(result.period, IntervalSchedule.MINUTES)
+
+    def test_from_schedule_period_hours(self):
+        schedule = schedules.schedule(run_every=timedelta(hours=2))
+        result = IntervalSchedule.from_schedule(schedule, period=IntervalSchedule.HOURS)
+        self.assertIsInstance(result.every, int)
+        self.assertEqual(result.every, 2)
+        self.assertEqual(result.period, IntervalSchedule.HOURS)
+
+    def test_from_schedule_period_days(self):
+        schedule = schedules.schedule(run_every=timedelta(days=5))
+        result = IntervalSchedule.from_schedule(schedule, period=IntervalSchedule.DAYS)
+        self.assertIsInstance(result.every, int)
+        self.assertEqual(result.every, 5)
+        self.assertEqual(result.period, IntervalSchedule.DAYS)
+
+    def test_from_schedule_period_microseconds(self):
+        schedule = schedules.schedule(run_every=timedelta(microseconds=50_000))
+        result = IntervalSchedule.from_schedule(
+            schedule,
+            period=IntervalSchedule.MICROSECONDS
+        )
+        self.assertIsInstance(result.every, int)
+        self.assertEqual(result.every, 50_000)
+        self.assertEqual(result.period, IntervalSchedule.MICROSECONDS)
+
+    def test_from_schedule_period_rounds_down(self):
+        schedule = schedules.schedule(run_every=timedelta(seconds=100))
+        result = IntervalSchedule.from_schedule(
+            schedule,
+            period=IntervalSchedule.MINUTES
+        )
+        self.assertIsInstance(result.every, int)
+        self.assertEqual(result.every, 1)
+        self.assertEqual(result.period, IntervalSchedule.MINUTES)
+
+    def test_from_schedule_period_raises_when_run_every_below_period(self):
+        schedule = schedules.schedule(run_every=timedelta(seconds=30))
+        with self.assertRaises(ValidationError):
+            IntervalSchedule.from_schedule(schedule, period=IntervalSchedule.MINUTES)
+
 
 class ClockedScheduleTestCase(TestCase, TestDuplicatesMixin):
 
@@ -153,8 +212,8 @@ class ClockedScheduleTestCase(TestCase, TestDuplicatesMixin):
     @override_settings(TIME_ZONE='Africa/Cairo')
     def test_timezone_format(self):
         """Ensure scheduled time is not shown in UTC when timezone is used"""
-        tz_info = datetime.datetime.now(ZoneInfo(settings.TIME_ZONE))
-        schedule, created = ClockedSchedule.objects.get_or_create(
+        tz_info = datetime.now(ZoneInfo(settings.TIME_ZONE))
+        schedule, _created = ClockedSchedule.objects.get_or_create(
             clocked_time=tz_info)
         # testnig str(schedule) calls make_aware() internally
         assert str(schedule.clocked_time) == str(schedule)
@@ -256,3 +315,45 @@ class HumanReadableTestCase(TestCase):
                 f"At 02:00 AM{expected} UTC",
                 day_day_of_week,
             )
+
+    def test_uses_12h_time_format(self):
+        """Ensure human_readable uses 12-hour format regardless of default."""
+        cron = CrontabSchedule.objects.create(
+            hour="14",
+            minute="30",
+            day_of_week="*",
+        )
+        self.assertEqual(cron.human_readable, "At 02:30 PM UTC")
+
+    def test_format_error_fallback(self):
+        """FormatError falls back to raw cron expression."""
+        cron = CrontabSchedule.objects.create(
+            hour="2", minute="0", day_of_week="mon",
+        )
+        with patch(
+            "django_celery_beat.models.get_description",
+            side_effect=FormatError("bad"),
+        ):
+            self.assertEqual(cron.human_readable, "0 2 * * 1 UTC")
+
+    def test_missing_field_error_fallback(self):
+        """MissingFieldError falls back to raw cron expression."""
+        cron = CrontabSchedule.objects.create(
+            hour="2", minute="0", day_of_week="mon",
+        )
+        with patch(
+            "django_celery_beat.models.get_description",
+            side_effect=MissingFieldError("bad"),
+        ):
+            self.assertEqual(cron.human_readable, "0 2 * * 1 UTC")
+
+    def test_wrong_argument_error_fallback(self):
+        """WrongArgumentError falls back to raw cron expression."""
+        cron = CrontabSchedule.objects.create(
+            hour="2", minute="0", day_of_week="mon",
+        )
+        with patch(
+            "django_celery_beat.models.get_description",
+            side_effect=WrongArgumentError("bad"),
+        ):
+            self.assertEqual(cron.human_readable, "0 2 * * 1 UTC")
